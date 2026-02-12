@@ -3,65 +3,131 @@
 Author: Anthony
 """
 
-from config import *
+from config import LOCAL_PATH, URLS
 import requests
 import zipfile
 import os
 import shutil
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-def download(url,path):
-    response = requests.get(url)
 
-    if response.status_code == 200:
-        with open(path, "wb") as f:
-                f.write(response.content)
-                
-    else:
-        print(f"Error downloading {url}")
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def create_session(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 503, 504)):
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def download(url, path, session=None, timeout=30):
+    session = session or create_session()
+    logger.info("Downloading %s -> %s", url, path)
+    try:
+        with session.get(url, timeout=timeout, stream=True) as resp:
+            resp.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        return True
+    except requests.RequestException as e:
+        logger.error("Failed to download %s: %s", url, e)
+        return False
+
 
 def unzip(zip_path, dest_path):
+    if not os.path.exists(zip_path):
+        logger.error("ZIP not found: %s", zip_path)
+        return []
+
+    if not zipfile.is_zipfile(zip_path):
+        logger.error("Invalid ZIP file: %s", zip_path)
+        return []
+
     try:
-        if not zipfile.is_zipfile(zip_path):
-            print(f"Error: {zip_path} invalid ZIP.")
-            return
-        
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            namelist = zip_ref.namelist()
             zip_ref.extractall(dest_path)
-
-        os.remove(zip_path)
-
-    except FileNotFoundError:
-        print(f"Error: File not found in {zip_path}")
+        try:
+            os.remove(zip_path)
+        except OSError:
+            logger.warning("Could not remove zip %s", zip_path)
+        logger.info("Extracted %s files from %s", len(namelist), zip_path)
+        return namelist
     except zipfile.BadZipFile:
-        print(f"Error: File {zip_path} damaged [10].")
-    except PermissionError:
-        print(f"Error: Access denied to {zip_path}.")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-    
-    return zip_ref.namelist()
+        logger.exception("Bad zip file %s", zip_path)
+        return []
+    except Exception:
+        logger.exception("Unexpected error extracting %s", zip_path)
+        return []
 
-def rename (name,new_name):
-    if os.path.exists(name):
-        os.rename(name, new_name)
 
-shutil.rmtree(LOCAL_PATH)
-os.makedirs(LOCAL_PATH)
+def rename(src, dst):
+    try:
+        if os.path.exists(src):
+            os.replace(src, dst)
+            logger.info("Renamed %s -> %s", src, dst)
+        else:
+            logger.warning("Source file does not exist: %s", src)
+    except Exception:
+        logger.exception("Failed to rename %s to %s", src, dst)
 
-for url,name in URLS:
 
-    file_name = url.split("/")[-1]
-    complete_path = LOCAL_PATH + file_name
-    print(f"Dowloading: {file_name}")
+def main():
+    # Recreate local path safely
+    if os.path.exists(LOCAL_PATH):
+        logger.info("Removing existing local path %s", LOCAL_PATH)
+        try:
+            shutil.rmtree(LOCAL_PATH)
+        except Exception:
+            logger.exception("Failed to remove %s", LOCAL_PATH)
+    os.makedirs(LOCAL_PATH, exist_ok=True)
 
-    download(url,complete_path)
+    session = create_session()
 
-    csv = "".join(unzip(complete_path,LOCAL_PATH))
-    extension = "." + csv.split(".")[-1]
-    final_name = LOCAL_PATH + name + extension
+    for url, name in URLS:
+        file_name = os.path.basename(url)
+        complete_path = os.path.join(LOCAL_PATH, file_name)
 
-    rename(LOCAL_PATH + csv,final_name)
-    print(f"Saved: {final_name}")
+        if not download(url, complete_path, session=session):
+            logger.warning("Skipping %s due to download failure", url)
+            continue
+
+        extracted = unzip(complete_path, LOCAL_PATH)
+        if not extracted:
+            logger.warning("No files extracted from %s", complete_path)
+            continue
+
+        # prefer first CSV found
+        csv_files = [n for n in extracted if n.lower().endswith('.csv')]
+        if not csv_files:
+            # if no csv, pick first entry
+            csv_name = extracted[0]
+        else:
+            csv_name = csv_files[0]
+
+        src = os.path.join(LOCAL_PATH, csv_name)
+        _, ext = os.path.splitext(csv_name)
+        final_name = os.path.join(LOCAL_PATH, name + ext)
+
+        rename(src, final_name)
+        logger.info("Saved: %s", final_name)
+
+
+if __name__ == '__main__':
+    main()
 
 
 
