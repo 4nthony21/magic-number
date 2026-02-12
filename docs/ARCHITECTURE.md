@@ -1,4 +1,5 @@
 # ETL Architecture
+A batch architecture will be developed, considering that the information is not updated in real time. In addition, open source technologies have been considered due to the origin and volume of the information, as well as their easy integration with cloud and on-premise tools.
 
 ## Flow
 1. `ETL/config.py` define las `URLS`, el `LOCAL_PATH` y `TABLES`.
